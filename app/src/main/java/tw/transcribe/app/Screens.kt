@@ -11,8 +11,10 @@ import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
@@ -132,11 +134,27 @@ fun LiveScreen(vm: LiveViewModel) {
             Spacer(Modifier.width(12.dp))
             Text(vm.status, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
         }
+        // 功能按鈕放在上方，避免被部分手機的系統導覽列遮住
+        val has = vm.screen.any { it.entries.isNotEmpty() }
+        Row(
+            Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(top = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            OutlinedButton(onClick = { showRecords = true }) { Text("匯出紀錄（${vm.saved.size}）") }
+            OutlinedButton(enabled = vm.screen.isNotEmpty() || vm.partial.isNotBlank(), onClick = { confirmReset = true }) { Text("重置") }
+            OutlinedButton(enabled = has, onClick = { copy(ctx, screenText()) }) { Text("複製") }
+            OutlinedButton(enabled = has, onClick = { FileUtil.share(ctx, screenText()) }) { Text("分享") }
+        }
         Spacer(Modifier.height(8.dp))
         HorizontalDivider()
 
         SelectionContainer(Modifier.weight(1f)) {
-            LazyColumn(state = listState, modifier = Modifier.fillMaxSize().padding(vertical = 8.dp)) {
+            LazyColumn(
+                state = listState,
+                modifier = Modifier.fillMaxSize(),
+                // 底部多留空間，最新一句不會被導覽列擋住
+                contentPadding = PaddingValues(top = 8.dp, bottom = 64.dp),
+            ) {
                 items(rows.size) { i ->
                     when (val row = rows[i]) {
                         is LiveRow.Header -> Text(
@@ -172,14 +190,6 @@ fun LiveScreen(vm: LiveViewModel) {
             }
         }
 
-        HorizontalDivider()
-        Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.SpaceBetween) {
-            val has = vm.screen.any { it.entries.isNotEmpty() }
-            TextButton(enabled = has, onClick = { copy(ctx, screenText()) }) { Text("複製") }
-            TextButton(enabled = has, onClick = { FileUtil.share(ctx, screenText()) }) { Text("分享") }
-            TextButton(onClick = { showRecords = true }) { Text("匯出紀錄（${vm.saved.size}）") }
-            TextButton(enabled = vm.screen.isNotEmpty() || vm.partial.isNotBlank(), onClick = { confirmReset = true }) { Text("重置") }
-        }
     }
 
     if (confirmReset) {
