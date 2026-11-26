@@ -25,6 +25,7 @@ import kotlin.coroutines.cancellation.CancellationException
 
 class LiveViewModel(app: Application) : AndroidViewModel(app) {
     val segments = mutableStateListOf<Segment>()
+    val records = mutableStateListOf<LiveRecord>()
     var partial by mutableStateOf("")
         private set
     var running by mutableStateOf(false)
@@ -36,6 +37,12 @@ class LiveViewModel(app: Application) : AndroidViewModel(app) {
     private var sessionStartMs = 0L
     private var elapsedBeforeMs = 0L
     private var utteranceStartSec = -1.0
+    private var sessionRecordedAtMs = 0L
+    private var sessionSegmentStartIndex = 0
+
+    init {
+        records.addAll(LiveRecordStore.load(app))
+    }
 
     private fun nowSec() = (SystemClock.elapsedRealtime() - sessionStartMs) / 1000.0
 
@@ -48,6 +55,8 @@ class LiveViewModel(app: Application) : AndroidViewModel(app) {
         }
         val s = AppSettings(ctx)
         sessionStartMs = SystemClock.elapsedRealtime() - elapsedBeforeMs
+        sessionRecordedAtMs = System.currentTimeMillis()
+        sessionSegmentStartIndex = segments.size
         running = true
         status = "啟動中…"
         transcriber = LiveTranscriber(ctx, s.preferOffline, s.muteBeep, object : LiveTranscriber.Callback {
@@ -87,7 +96,14 @@ class LiveViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun finishSession() {
         if (partial.isNotBlank()) commit(partial)
-        if (running) elapsedBeforeMs = SystemClock.elapsedRealtime() - sessionStartMs
+        if (running) {
+            elapsedBeforeMs = SystemClock.elapsedRealtime() - sessionStartMs
+            val sessionSegments = segments.drop(sessionSegmentStartIndex)
+            if (sessionSegments.isNotEmpty()) {
+                records.add(LiveRecord(sessionRecordedAtMs, sessionSegments))
+                LiveRecordStore.save(getApplication(), records)
+            }
+        }
         running = false
     }
 
@@ -97,6 +113,16 @@ class LiveViewModel(app: Application) : AndroidViewModel(app) {
         partial = ""
         elapsedBeforeMs = 0
         status = "已清除"
+    }
+
+    fun reset() {
+        if (running) stop()
+        segments.clear()
+        partial = ""
+        elapsedBeforeMs = 0
+        sessionRecordedAtMs = 0L
+        sessionSegmentStartIndex = 0
+        status = "已重置，畫面紀錄已清除"
     }
 
     override fun onCleared() {

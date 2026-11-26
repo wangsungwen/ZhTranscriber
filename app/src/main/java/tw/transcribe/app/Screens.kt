@@ -101,6 +101,16 @@ fun LiveScreen(vm: LiveViewModel) {
             }
         }
     }
+    val historySaveLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/plain")) { uri ->
+        if (uri != null) {
+            try {
+                FileUtil.writeText(ctx, uri, TranscriptFormat.toHistoryText(vm.records, settings.showTimestamps))
+                toast(ctx, "已匯出 ${vm.records.size} 筆紀錄")
+            } catch (e: Exception) {
+                toast(ctx, "匯出失敗：${e.message}")
+            }
+        }
+    }
 
     val count = vm.segments.size + if (vm.partial.isNotBlank()) 1 else 0
     LaunchedEffect(count, vm.partial) {
@@ -125,6 +135,7 @@ fun LiveScreen(vm: LiveViewModel) {
         }
         Spacer(Modifier.height(8.dp))
         HorizontalDivider()
+        Text("已保存 ${vm.records.size} 筆即時轉寫紀錄", style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 8.dp))
 
         SelectionContainer(Modifier.weight(1f)) {
             LazyColumn(state = listState, modifier = Modifier.fillMaxSize().padding(vertical = 8.dp)) {
@@ -156,12 +167,22 @@ fun LiveScreen(vm: LiveViewModel) {
         }
 
         HorizontalDivider()
+        val has = vm.segments.isNotEmpty()
         Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.SpaceBetween) {
-            val has = vm.segments.isNotEmpty()
             TextButton(enabled = has, onClick = { copy(ctx, TranscriptFormat.toText(vm.segments, settings.showTimestamps)) }) { Text("複製") }
             TextButton(enabled = has, onClick = { FileUtil.share(ctx, TranscriptFormat.toText(vm.segments, settings.showTimestamps)) }) { Text("分享") }
             TextButton(enabled = has, onClick = { saveLauncher.launch("即時逐字稿_${stamp()}.txt") }) { Text("存成TXT") }
             TextButton(enabled = has || vm.partial.isNotBlank(), onClick = { vm.clear() }) { Text("清除") }
+        }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            TextButton(
+                enabled = vm.records.isNotEmpty(),
+                onClick = { historySaveLauncher.launch("即時轉寫紀錄_${stamp()}.txt") },
+            ) { Text("匯出紀錄") }
+            TextButton(
+                enabled = vm.records.isNotEmpty() || has || vm.partial.isNotBlank(),
+                onClick = { vm.reset() },
+            ) { Text("重置") }
         }
     }
 }
