@@ -3,7 +3,6 @@ package tw.transcribe.app
 import android.app.Application
 import android.content.Intent
 import android.net.Uri
-import android.os.SystemClock
 import android.speech.SpeechRecognizer
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -16,6 +15,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.IOException
@@ -24,8 +25,14 @@ import kotlin.coroutines.cancellation.CancellationException
 // ───────────────────────── 即時轉寫 ─────────────────────────
 
 class LiveViewModel(app: Application) : AndroidViewModel(app) {
-    val segments = mutableStateListOf<Segment>()
-    val records = mutableStateListOf<LiveRecord>()
+    private val store = RecordStore(app)
+
+    /** 已保存的紀錄（新到舊）。重置畫面不會影響這裡。 */
+    val saved = mutableStateListOf<LiveRecord>().apply { addAll(store.load()) }
+
+    /** 目前畫面上顯示的紀錄（可能包含多次開始／停止）。 */
+    val screen = mutableStateListOf<LiveRecord>()
+
     var partial by mutableStateOf("")
         private set
     var running by mutableStateOf(false)
@@ -34,17 +41,10 @@ class LiveViewModel(app: Application) : AndroidViewModel(app) {
         private set
 
     private var transcriber: LiveTranscriber? = null
-    private var sessionStartMs = 0L
-    private var elapsedBeforeMs = 0L
-    private var utteranceStartSec = -1.0
-    private var sessionRecordedAtMs = 0L
-    private var sessionSegmentStartIndex = 0
+    private var current: LiveRecord? = null
+    private var utteranceStartMs = -1L
 
-    init {
-        records.addAll(LiveRecordStore.load(app))
-    }
-
-    private fun nowSec() = (SystemClock.elapsedRealtime() - sessionStartMs) / 1000.0
+    private fun now() = System.currentTimeMillis()
 
     fun start() {
         if (running) return
@@ -54,18 +54,22 @@ class LiveViewModel(app: Application) : AndroidViewModel(app) {
             return
         }
         val s = AppSettings(ctx)
-        sessionStartMs = SystemClock.elapsedRealtime() - elapsedBeforeMs
-        sessionRecordedAtMs = System.currentTimeMillis()
-        sessionSegmentStartIndex = segments.size
+        // 以按下「開始」當下的手機時間建立一筆新紀錄
+        val t = now()
+        val rec = LiveRecord(id = t, startMs = t, endMs = t, entries = emptyList())
+        current = rec
+        screen.add(rec)
+        utteranceStartMs = -1L
+        partial = ""
         running = true
-        status = "啟動中…"
+        status = "啟動中…（開始時間 ${RecordFormat.dateTime(t)}）"
         transcriber = LiveTranscriber(ctx, s.preferOffline, s.muteBeep, object : LiveTranscriber.Callback {
             override fun onSpeechStart() {
-                if (utteranceStartSec < 0) utteranceStartSec = nowSec()
+                if (utteranceStartMs < 0) utteranceStartMs = now()
             }
 
             override fun onPartial(text: String) {
-                if (utteranceStartSec < 0) utteranceStartSec = nowSec()
+                if (utteranceStartMs < 0) utteranceStartMs = now()
                 partial = text
             }
 
@@ -73,60 +77,103 @@ class LiveViewModel(app: Application) : AndroidViewModel(app) {
             override fun onStatus(msg: String) { status = msg }
             override fun onFatal(msg: String) {
                 transcriber = null
-                finishSession()
-                status = msg
+                status = msg + "\n" + finishSession()
             }
         }).also { it.start() }
     }
 
+    private fun updateCurrent(transform: (LiveRecord) -> LiveRecord) {
+        val c = current ?: return
+        val n = transform(c)
+        current = n
+        val i = screen.indexOfFirst { it.id == c.id }
+        if (i >= 0) screen[i] = n
+    }
+
     private fun commit(text: String) {
-        val end = nowSec()
-        val start = if (utteranceStartSec >= 0) utteranceStartSec else end
-        segments.add(Segment(start, end, text))
+        val end = now()
+        val start = if (utteranceStartMs > 0) utteranceStartMs else end
+        updateCurrent { it.copy(endMs = end, entries = it.entries + LiveEntry(start, end, text.trim())) }
         partial = ""
-        utteranceStartSec = -1.0
+        utteranceStartMs = -1L
+        // 每句完成就先存一次，避免 App 被系統關閉時遺失內容
+        persistCurrent()
+    }
+
+    private fun persistCurrent() {
+        val c = current ?: return
+        if (c.entries.isEmpty()) return
+        val i = saved.indexOfFirst { it.id == c.id }
+        if (i >= 0) saved[i] = c else saved.add(0, c)
+        persist()
+    }
+
+    @Volatile private var pendingSnapshot: List<LiveRecord> = emptyList()
+    private val saveMutex = Mutex()
+
+    private fun persist() {
+        pendingSnapshot = saved.toList()
+        viewModelScope.launch(Dispatchers.IO) {
+            // 一律寫入「最新」的快照，避免多次寫入順序顛倒造成舊資料覆蓋新資料
+            saveMutex.withLock {
+                try { store.save(pendingSnapshot) } catch (_: Exception) {}
+            }
+        }
     }
 
     fun stop() {
         transcriber?.stop()
         transcriber = null
-        finishSession()
-        status = "已停止"
+        status = finishSession()
     }
 
-    private fun finishSession() {
+    /** 結束目前這筆紀錄並自動保存，回傳狀態訊息。 */
+    private fun finishSession(): String {
         if (partial.isNotBlank()) commit(partial)
-        if (running) {
-            elapsedBeforeMs = SystemClock.elapsedRealtime() - sessionStartMs
-            val sessionSegments = segments.drop(sessionSegmentStartIndex)
-            if (sessionSegments.isNotEmpty()) {
-                records.add(LiveRecord(sessionRecordedAtMs, sessionSegments))
-                LiveRecordStore.save(getApplication(), records)
-            }
-        }
-        running = false
-    }
-
-    fun clear() {
-        if (running) stop()
-        segments.clear()
         partial = ""
-        elapsedBeforeMs = 0
-        status = "已清除"
+        utteranceStartMs = -1L
+        updateCurrent { it.copy(endMs = now()) }
+        val c = current
+        persistCurrent()
+        current = null
+        running = false
+        return if (c != null && c.entries.isNotEmpty()) {
+            "已停止，紀錄已自動保存（${c.entries.size} 句）"
+        } else {
+            if (c != null) screen.removeAll { it.id == c.id }
+            "已停止（沒有辨識到內容，未產生紀錄）"
+        }
     }
 
+    /** 重置：只清除畫面上的逐字稿與暫存狀態，已保存的紀錄保留。 */
     fun reset() {
         if (running) stop()
-        segments.clear()
+        screen.clear()
         partial = ""
-        elapsedBeforeMs = 0
-        sessionRecordedAtMs = 0L
-        sessionSegmentStartIndex = 0
-        status = "已重置，畫面紀錄已清除"
+        utteranceStartMs = -1L
+        status = "畫面已重置；先前的內容仍保存在「匯出紀錄」中"
+    }
+
+    /** 只有在「匯出紀錄」視窗中確認後才會呼叫。 */
+    fun deleteRecords(ids: Set<Long>) {
+        saved.removeAll { it.id in ids }
+        persist()
     }
 
     override fun onCleared() {
         transcriber?.stop()
+        transcriber = null
+        if (running) {
+            if (partial.isNotBlank()) commit(partial)
+            updateCurrent { it.copy(endMs = now()) }
+            val c = current
+            if (c != null && c.entries.isNotEmpty()) {
+                val i = saved.indexOfFirst { it.id == c.id }
+                if (i >= 0) saved[i] = c else saved.add(0, c)
+                pendingSnapshot = saved.toList()
+                try { store.save(pendingSnapshot) } catch (_: Exception) {}
+            }
+        }
     }
 }
 

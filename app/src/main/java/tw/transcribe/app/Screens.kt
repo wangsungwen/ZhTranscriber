@@ -10,6 +10,7 @@ import android.provider.DocumentsContract
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
@@ -29,9 +30,11 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -76,12 +79,20 @@ private fun stamp(): String = SimpleDateFormat("yyyyMMdd_HHmm", Locale.TAIWAN).f
 
 // ───────────────────────── 即時轉寫 ─────────────────────────
 
+/** 畫面上顯示用的一列：紀錄標題或一句話。 */
+private sealed class LiveRow {
+    data class Header(val rec: LiveRecord) : LiveRow()
+    data class Line(val rec: LiveRecord, val entry: LiveEntry) : LiveRow()
+}
+
 @Composable
 fun LiveScreen(vm: LiveViewModel) {
     val ctx = LocalContext.current
     val settings = remember { AppSettings(ctx) }
     val listState = rememberLazyListState()
     val view = LocalView.current
+    var showRecords by remember { mutableStateOf(false) }
+    var confirmReset by remember { mutableStateOf(false) }
 
     DisposableEffect(vm.running) {
         view.keepScreenOn = vm.running
@@ -91,28 +102,16 @@ fun LiveScreen(vm: LiveViewModel) {
     val micPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
         if (ok) vm.start() else toast(ctx, "需要麥克風權限才能即時轉寫")
     }
-    val saveLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/plain")) { uri ->
-        if (uri != null) {
-            try {
-                FileUtil.writeText(ctx, uri, TranscriptFormat.toText(vm.segments, settings.showTimestamps))
-                toast(ctx, "已儲存")
-            } catch (e: Exception) {
-                toast(ctx, "儲存失敗：${e.message}")
-            }
-        }
-    }
-    val historySaveLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/plain")) { uri ->
-        if (uri != null) {
-            try {
-                FileUtil.writeText(ctx, uri, TranscriptFormat.toHistoryText(vm.records, settings.showTimestamps))
-                toast(ctx, "已匯出 ${vm.records.size} 筆紀錄")
-            } catch (e: Exception) {
-                toast(ctx, "匯出失敗：${e.message}")
-            }
-        }
-    }
 
-    val count = vm.segments.size + if (vm.partial.isNotBlank()) 1 else 0
+    val rows = buildList {
+        for (r in vm.screen) {
+            add(LiveRow.Header(r))
+            for (e in r.entries) add(LiveRow.Line(r, e))
+        }
+    }
+    val screenText = { vm.screen.filter { it.entries.isNotEmpty() }.joinToString("\n") { RecordFormat.recordText(it) } }
+
+    val count = rows.size + if (vm.partial.isNotBlank()) 1 else 0
     LaunchedEffect(count, vm.partial) {
         if (count > 0) listState.animateScrollToItem(count - 1)
     }
@@ -135,21 +134,28 @@ fun LiveScreen(vm: LiveViewModel) {
         }
         Spacer(Modifier.height(8.dp))
         HorizontalDivider()
-        Text("已保存 ${vm.records.size} 筆即時轉寫紀錄", style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 8.dp))
 
         SelectionContainer(Modifier.weight(1f)) {
             LazyColumn(state = listState, modifier = Modifier.fillMaxSize().padding(vertical = 8.dp)) {
-                items(vm.segments.size) { i ->
-                    val s = vm.segments[i]
-                    Row(Modifier.padding(vertical = 4.dp)) {
-                        if (settings.showTimestamps) {
-                            Text(
-                                TranscriptFormat.ts(s.startSec) + "  ",
-                                color = MaterialTheme.colorScheme.primary,
-                                fontSize = 13.sp,
-                            )
+                items(rows.size) { i ->
+                    when (val row = rows[i]) {
+                        is LiveRow.Header -> Text(
+                            "▶ 錄音開始 " + RecordFormat.dateTimeWeek(row.rec.startMs),
+                            color = MaterialTheme.colorScheme.primary,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 14.sp,
+                            modifier = Modifier.padding(top = if (i == 0) 0.dp else 14.dp, bottom = 4.dp),
+                        )
+                        is LiveRow.Line -> Row(Modifier.padding(vertical = 4.dp)) {
+                            if (settings.showTimestamps) {
+                                Text(
+                                    RecordFormat.entryTime(row.rec.startMs, row.entry.startMs) + "  ",
+                                    color = MaterialTheme.colorScheme.primary,
+                                    fontSize = 13.sp,
+                                )
+                            }
+                            Text(row.entry.text, fontSize = 18.sp, lineHeight = 26.sp)
                         }
-                        Text(s.text, fontSize = 18.sp, lineHeight = 26.sp)
                     }
                 }
                 if (vm.partial.isNotBlank()) {
@@ -167,23 +173,121 @@ fun LiveScreen(vm: LiveViewModel) {
         }
 
         HorizontalDivider()
-        val has = vm.segments.isNotEmpty()
         Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.SpaceBetween) {
-            TextButton(enabled = has, onClick = { copy(ctx, TranscriptFormat.toText(vm.segments, settings.showTimestamps)) }) { Text("複製") }
-            TextButton(enabled = has, onClick = { FileUtil.share(ctx, TranscriptFormat.toText(vm.segments, settings.showTimestamps)) }) { Text("分享") }
-            TextButton(enabled = has, onClick = { saveLauncher.launch("即時逐字稿_${stamp()}.txt") }) { Text("存成TXT") }
-            TextButton(enabled = has || vm.partial.isNotBlank(), onClick = { vm.clear() }) { Text("清除") }
+            val has = vm.screen.any { it.entries.isNotEmpty() }
+            TextButton(enabled = has, onClick = { copy(ctx, screenText()) }) { Text("複製") }
+            TextButton(enabled = has, onClick = { FileUtil.share(ctx, screenText()) }) { Text("分享") }
+            TextButton(onClick = { showRecords = true }) { Text("匯出紀錄（${vm.saved.size}）") }
+            TextButton(enabled = vm.screen.isNotEmpty() || vm.partial.isNotBlank(), onClick = { confirmReset = true }) { Text("重置") }
         }
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-            TextButton(
-                enabled = vm.records.isNotEmpty(),
-                onClick = { historySaveLauncher.launch("即時轉寫紀錄_${stamp()}.txt") },
-            ) { Text("匯出紀錄") }
-            TextButton(
-                enabled = vm.records.isNotEmpty() || has || vm.partial.isNotBlank(),
-                onClick = { vm.reset() },
-            ) { Text("重置") }
+    }
+
+    if (confirmReset) {
+        AlertDialog(
+            onDismissRequest = { confirmReset = false },
+            title = { Text("重置畫面？") },
+            text = { Text("只會清除目前畫面上的逐字稿與暫存狀態。已保存的紀錄不會被刪除，之後仍可在「匯出紀錄」中找到。" + if (vm.running) "\n\n目前正在錄音，會先停止並自動保存。" else "") },
+            confirmButton = { TextButton(onClick = { vm.reset(); confirmReset = false }) { Text("重置") } },
+            dismissButton = { TextButton(onClick = { confirmReset = false }) { Text("取消") } },
+        )
+    }
+
+    if (showRecords) RecordsDialog(vm) { showRecords = false }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun RecordsDialog(vm: LiveViewModel, onDismiss: () -> Unit) {
+    val ctx = LocalContext.current
+    val selected = remember { mutableStateListOf<Long>() }
+    var pending by remember { mutableStateOf<String?>(null) }
+    var confirmDelete by remember { mutableStateOf(false) }
+
+    val saveLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/plain")) { uri ->
+        val content = pending
+        pending = null
+        if (uri != null && content != null) {
+            try { FileUtil.writeText(ctx, uri, content); toast(ctx, "已匯出") } catch (e: Exception) { toast(ctx, "匯出失敗：${e.message}") }
         }
+    }
+
+    // 有勾選就匯出勾選的；沒勾選就匯出全部
+    val targets = { if (selected.isEmpty()) vm.saved.toList() else vm.saved.filter { it.id in selected } }
+    val fileName = {
+        val t = targets()
+        if (t.size == 1) "即時轉寫_${RecordFormat.fileStamp(t[0].startMs)}.txt"
+        else "即時轉寫紀錄_${RecordFormat.fileStamp(System.currentTimeMillis())}.txt"
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("即時轉寫紀錄（${vm.saved.size} 筆）") },
+        text = {
+            Column {
+                if (vm.saved.isEmpty()) {
+                    Text("目前沒有已保存的紀錄。每次按「開始」會建立一筆紀錄，按「停止」後自動保存。")
+                } else {
+                    Text(
+                        if (selected.isEmpty()) "未勾選時會匯出全部紀錄" else "已勾選 ${selected.size} 筆",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    LazyColumn(Modifier.heightIn(max = 420.dp).padding(top = 6.dp)) {
+                        items(vm.saved, key = { it.id }) { r ->
+                            val checked = r.id in selected
+                            Row(
+                                Modifier.fillMaxWidth().clickable { if (checked) selected.remove(r.id) else selected.add(r.id) }.padding(vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Checkbox(checked = checked, onCheckedChange = { if (it) selected.add(r.id) else selected.remove(r.id) })
+                                Column(Modifier.weight(1f)) {
+                                    Text(RecordFormat.dateTimeWeek(r.startMs), fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                                    Text(
+                                        "${r.entries.size} 句・${RecordFormat.duration(r.endMs - r.startMs)}　" + (r.entries.firstOrNull()?.text ?: ""),
+                                        style = MaterialTheme.typography.bodySmall,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    FlowRow(Modifier.padding(top = 6.dp)) {
+                        TextButton(onClick = {
+                            if (selected.size == vm.saved.size) selected.clear()
+                            else { selected.clear(); selected.addAll(vm.saved.map { it.id }) }
+                        }) { Text(if (selected.size == vm.saved.size) "取消全選" else "全選") }
+                        TextButton(onClick = { copy(ctx, RecordFormat.exportText(targets())) }) { Text("複製") }
+                        TextButton(onClick = { FileUtil.share(ctx, RecordFormat.exportText(targets())) }) { Text("分享") }
+                        TextButton(enabled = selected.isNotEmpty() && !vm.running, onClick = { confirmDelete = true }) {
+                            Text("刪除勾選", color = if (selected.isNotEmpty() && !vm.running) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f))
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(enabled = vm.saved.isNotEmpty(), onClick = {
+                pending = RecordFormat.exportText(targets())
+                saveLauncher.launch(fileName())
+            }) { Text("匯出 TXT") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("關閉") } },
+    )
+
+    if (confirmDelete) {
+        AlertDialog(
+            onDismissRequest = { confirmDelete = false },
+            title = { Text("永久刪除 ${selected.size} 筆紀錄？") },
+            text = { Text("刪除後無法復原。建議先匯出備份。") },
+            confirmButton = {
+                TextButton(onClick = {
+                    vm.deleteRecords(selected.toSet())
+                    selected.clear()
+                    confirmDelete = false
+                }) { Text("刪除", color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = { TextButton(onClick = { confirmDelete = false }) { Text("取消") } },
+        )
     }
 }
 
